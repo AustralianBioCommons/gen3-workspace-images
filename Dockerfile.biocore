@@ -1,0 +1,113 @@
+# Productized RStudio for Gen3 — BioCore
+FROM ghcr.io/rocker-org/rstudio:4.4.2
+
+USER root
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential gfortran git curl python3-pip \
+    libcurl4-openssl-dev libssl-dev libxml2-dev libgit2-dev \
+    zlib1g-dev libbz2-dev liblzma-dev libpcre2-dev libomp-dev libtbb-dev \
+    libhdf5-dev \
+    libcairo2-dev libpango1.0-dev libharfbuzz-dev libfribidi-dev \
+    libfreetype6-dev libfontconfig1-dev \
+    libgsl-dev libfftw3-dev \
+    fonts-dejavu fonts-liberation fonts-noto fonts-noto-cjk fonts-noto-color-emoji \
+    unzip \
+    # needed for ragg build
+    pkg-config libpng-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+# AWS CLI v2
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip \
+  && unzip -q /tmp/awscliv2.zip -d /tmp \
+  && /tmp/aws/install -i /usr/local/aws-cli -b /usr/local/bin \
+  && rm -rf /tmp/aws /tmp/awscliv2.zip
+
+# s5cmd (pinned)
+ARG S5CMD_VERSION=2.2.2
+RUN curl -fsSL "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz" \
+  | tar -xz -C /tmp \
+  && mv /tmp/s5cmd /usr/local/bin/s5cmd \
+  && chmod +x /usr/local/bin/s5cmd
+
+# ---------------------------
+# R packages (BioCore set)
+# ---------------------------
+ARG BIOC_VERSION=3.19
+ENV BIOCONDUCTOR_VERSION=${BIOC_VERSION}
+
+# Use the Ubuntu 24.04 (noble) channel; pin snapshot for reproducibility
+ARG PPM_URL=https://packagemanager.posit.co/cran/__linux__/noble/2025-09-01
+ENV RSPM=${PPM_URL}
+
+# Install with pak (fails fast) + Bioconductor
+RUN R --vanilla <<'EOF'
+options(repos = c(CRAN = Sys.getenv("RSPM")))
+# install pak and BiocManager first
+install.packages(c("pak","BiocManager"))
+# CRAN packages (pak stops on errors)
+pak::pkg_install(c(
+  "tidyverse","data.table","arrow","matrixStats",
+  "ragg","ggtext","systemfonts","textshaping","RcppParallel"
+))
+# Bioconductor version + packages
+BiocManager::install(version = Sys.getenv("BIOCONDUCTOR_VERSION"), ask = FALSE)
+BiocManager::install(c(
+  "BiocGenerics","BiocParallel","S4Vectors","IRanges","GenomicRanges",
+  "SummarizedExperiment","DelayedArray","HDF5Array","rhdf5",
+  "DESeq2","edgeR","limma","SingleCellExperiment","scran","scater","biomaRt"
+), ask = FALSE, update = FALSE)
+EOF
+
+
+
+# Make sure rsession can find libR
+RUN echo "/usr/local/lib/R/lib" > /etc/ld.so.conf.d/R.conf && ldconfig
+ENV R_HOME=/usr/local/lib/R
+ENV LD_LIBRARY_PATH=/usr/local/lib/R/lib
+
+
+# RStudio config (OSS)
+COPY rserver.conf /etc/rstudio/rserver.conf
+
+# Stable IDs; writable HOME/PVC (idempotent)
+ENV USER=rstudio HOME=/home/rstudio
+RUN set -eux; \
+  [ "$(id -u rstudio)" = "1000" ] || usermod -u 1000 rstudio; \
+  [ "$(id -g rstudio)" = "100" ] || usermod -g 100 rstudio; \
+  chown -R 1000:100 /home/rstudio
+
+# Persist user libs and add /data convenience link
+ENV R_LIBS_USER=/home/rstudio/pd/R/x86_64-pc-linux-gnu-library/4.x
+RUN mkdir -p /home/rstudio/pd && chown -R 1000:100 /home/rstudio/pd \
+  && ln -s /home/rstudio/pd /data && chown -h 1000:100 /data
+
+# Reduce attack surface
+RUN find / -perm -4000 -type f -not -path "/bin/mount" -exec chmod u-s {} + 2>/dev/null || true
+
+RUN groupadd -r -g 1001 user && useradd -r -g user -u 1001 user
+WORKDIR /home/user
+EXPOSE 8787
+CMD ["/init"]
+RUN usermod -a -G users rstudio
+
+# Fix ALL permissions 
+RUN find /usr/local/lib/R -type d -exec chmod 755 {} \; && \
+    find /usr/local/lib/R -type f -exec chmod 644 {} \; && \
+    find /usr/local/lib/R/bin -type f -exec chmod 755 {} \; && \
+    find /usr/local/bin -type f -name "R*" -exec chmod 755 {} \; && \
+    chmod 644 /etc/profile /etc/passwd /etc/group
+
+# Startup script - THIS RUNS AT CONTAINER START
+RUN echo '#!/usr/bin/with-contenv bash \
+          \n# Fix permissions that might get reset \
+          \nchmod 644 /etc/passwd /etc/group 2>/dev/null || true \
+          \n## load /etc/environment vars first: \
+          \n for line in $( cat /etc/environment ) ; do export $line ; done \
+          \n cp /etc/rstudio/rserver.conf /etc/rstudio/rserver.conf.bak \
+          \n cat /etc/rstudio/rserver.conf.bak | grep -v www-frame-origin | grep -v www-root-path > /etc/rstudio/rserver.conf \
+          \n echo www-frame-origin=${WWW_FRAME_ORIGIN} >> /etc/rstudio/rserver.conf \
+          \n echo www-root-path=${WWW_ROOT_PATH} >> /etc/rstudio/rserver.conf \
+          \n exec /usr/lib/rstudio-server/bin/rserver --server-daemonize 0' \
+          > /etc/services.d/rstudio/run
+
+EXPOSE 8787

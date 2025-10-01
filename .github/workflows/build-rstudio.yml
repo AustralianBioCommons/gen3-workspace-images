@@ -1,0 +1,46 @@
+name: Build and Push rstudio-biocore
+
+on:
+  workflow_dispatch: # manually trigger
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.biocore"
+      - ".github/workflows/build-rstudio-biocore.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+      ECR_REPO: rstudio-biocore
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.IAM_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker image
+        run: |
+          IMAGE_TAG=$(date +"%Y-%m-%d-%H%M%S")
+          echo "Building $ECR_REPO:$IMAGE_TAG"
+          docker build -f Dockerfile.biocore -t $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+
+          # Also update latest tag
+          docker tag $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPO:latest
+          docker push $ECR_REGISTRY/$ECR_REPO:latest
